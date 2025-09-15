@@ -1,0 +1,458 @@
+import os
+from flask import Flask, request, jsonify, Response, flash, render_template, redirect, url_for
+from flask_sqlalchemy import SQLAlchemy
+from flask_bcrypt import Bcrypt
+from flask_socketio import SocketIO, join_room, emit
+import jwt
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+import hashlib
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, parse_qs
+
+# --- [IMPORTANTE] COLOQUE SUAS CHAVES DE API AQUI ---
+VT_API_KEY = "2a002bf45a4c2e70867701051091c42df8b0c9529d3cf6cd9009647a629413ae"
+URLSCAN_API_KEY = "0198f827-d271-716d-993c-409598a5779a"
+# ----------------------------------------------------
+requests.packages.urllib3.disable_warnings()
+
+# --- CONFIGURAÇÃO INICIAL (Seu código original, intacto) ---
+app = Flask(__name__)
+bcrypt = Bcrypt(app)
+app.config['SECRET_KEY'] = 'sua-chave-secreta-super-dificil-de-adivinhar'
+basedir = os.path.abspath(os.path.dirname(__file__))
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'veripay.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# --- MODELOS DO BANCO DE DADOS (Seu código original, intacto) ---
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    email = db.Column(db.String(100), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    def __str__(self): return self.name
+
+class Transaction(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    description = db.Column(db.String(200), nullable=False)
+    amount = db.Column(db.Float, nullable=False)
+    status = db.Column(db.String(50), default='PENDING', nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    seller_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    buyer_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    seller = db.relationship('User', foreign_keys=[seller_id])
+    buyer = db.relationship('User', foreign_keys=[buyer_id])
+    messages = db.relationship('ChatMessage', backref='transaction', lazy=True, cascade="all, delete-orphan")
+    def __str__(self): return f"ID: {self.id} - {self.description}"
+
+class ChatMessage(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    content = db.Column(db.String(500), nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    transaction_id = db.Column(db.Integer, db.ForeignKey('transaction.id'), nullable=False)
+    author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    author = db.relationship('User')
+
+class BehavioralEvent(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    event_type = db.Column(db.String(100), nullable=False)
+    value = db.Column(db.String(255), nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    transaction_id = db.Column(db.Integer, db.ForeignKey('transaction.id'), nullable=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+
+# --- DECORATOR DE TOKEN PARA A API (Seu código original, intacto) ---
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if 'Authorization' in request.headers:
+            try: token = request.headers['Authorization'].split(" ")[1]
+            except IndexError: return jsonify({'message': 'Formato do token é inválido!'}), 401
+        if not token: return jsonify({'message': 'Token está faltando!'}), 401
+        try:
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            current_user = User.query.get(data['user_id'])
+            if not current_user: return jsonify({'message': 'Usuário do token não encontrado!'}), 401
+        except Exception as e: return jsonify({'message': 'Token é inválido!', 'error': str(e)}), 401
+        return f(current_user, *args, **kwargs)
+    return decorated
+
+# --- [INÍCIO] ROTAS DA API PARA O APP ANDROID ---
+@app.route('/auth/register', methods=['POST'])
+def register():
+    data = request.get_json();
+    if not data or not all(k in data for k in ('name', 'email', 'password')): return jsonify({"message": "Campos faltando"}), 400
+    if User.query.filter_by(email=data['email']).first(): return jsonify({"message": "Email já cadastrado"}), 409
+    hashed_password = bcrypt.generate_password_hash(data['password']).decode('utf-8')
+    new_user = User(name=data['name'], email=data['email'], password_hash=hashed_password)
+    db.session.add(new_user); db.session.commit()
+    return jsonify({"message": "Usuário registrado com sucesso!"}), 201
+
+@app.route('/auth/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    if not data or not all(k in data for k in ('email', 'password')): return jsonify({"message": "Campos faltando"}), 400
+    user = User.query.filter_by(email=data['email']).first()
+    if not user or not bcrypt.check_password_hash(user.password_hash, data['password']): return jsonify({"message": "Credenciais inválidas"}), 401
+    payload = {'user_id': user.id, 'exp': datetime.now(timezone.utc) + timedelta(hours=24)}
+    token = jwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
+    return jsonify({"access_token": token}), 200
+
+@app.route('/transactions', methods=['POST'])
+@token_required
+def create_transaction(current_user):
+    data = request.get_json()
+    if not data or not data.get('description') or not data.get('amount'): return jsonify({'message': 'Descrição e valor são obrigatórios'}), 400
+    try: amount = float(data['amount'])
+    except (ValueError, TypeError): return jsonify({'message': 'Valor deve ser um número válido'}), 400
+    buyer_email = data.get('buyer_email')
+    buyer_id, status, buyer_name = (None, 'PENDING', None)
+    if buyer_email:
+        buyer = User.query.filter_by(email=buyer_email).first()
+        if not buyer: return jsonify({'message': f'Nenhum usuário encontrado com o email {buyer_email}.'}), 404
+        if current_user.id == buyer.id: return jsonify({'message': 'Você não pode criar uma transação para si mesmo.'}), 403
+        buyer_id, status, buyer_name = (buyer.id, 'AWAITING_PAYMENT', buyer.name)
+    new_transaction = Transaction(description=data['description'], amount=amount, seller_id=current_user.id, buyer_id=buyer_id, status=status)
+    db.session.add(new_transaction); db.session.commit()
+    return jsonify({'message': 'Transação criada com sucesso!', 'transaction_id': new_transaction.id}), 201
+
+@app.route('/transactions', methods=['GET'])
+@token_required
+def get_transactions(current_user):
+    transactions = Transaction.query.filter((Transaction.seller_id == current_user.id) | (Transaction.buyer_id == current_user.id)).order_by(Transaction.created_at.desc()).all()
+    output = [{'id': t.id, 'description': t.description, 'amount': t.amount, 'status': t.status, 'seller_id': t.seller_id, 'seller_name': t.seller.name, 'buyer_id': t.buyer_id, 'buyer_name': t.buyer.name if t.buyer else None} for t in transactions]
+    return jsonify({'transactions': output})
+
+@app.route('/transaction/<int:transaction_id>', methods=['GET'])
+@token_required
+def get_transaction_detail(current_user, transaction_id):
+    transaction = Transaction.query.get_or_404(transaction_id)
+    if transaction.seller_id != current_user.id and transaction.buyer_id != current_user.id: return jsonify({'message': 'Acesso negado'}), 403
+    return jsonify({'id': transaction.id, 'description': transaction.description, 'amount': transaction.amount, 'status': transaction.status, 'created_at': transaction.created_at.strftime('%d/%m/%Y %H:%M'), 'seller_id': transaction.seller_id, 'seller_name': transaction.seller.name, 'buyer_id': transaction.buyer_id, 'buyer_name': transaction.buyer.name if transaction.buyer else None})
+
+@app.route('/transaction/<int:transaction_id>/accept', methods=['POST'])
+@token_required
+def accept_transaction(current_user, transaction_id):
+    transaction = Transaction.query.get_or_404(transaction_id)
+    if transaction.seller_id == current_user.id: return jsonify({'message': 'Você não pode comprar seu próprio item'}), 403
+    if transaction.buyer_id is not None: return jsonify({'message': 'Esta transação já tem um comprador'}), 409
+    transaction.buyer_id, transaction.status = current_user.id, 'AWAITING_PAYMENT'
+    db.session.commit(); return jsonify({'message': 'Transação aceita!'})
+
+@app.route('/transaction/<int:transaction_id>/pay', methods=['POST'])
+@token_required
+def pay_transaction(current_user, transaction_id):
+    transaction = Transaction.query.get_or_404(transaction_id)
+    if transaction.buyer_id != current_user.id: return jsonify({'message': 'Você não é o comprador'}), 403
+    if transaction.status != 'AWAITING_PAYMENT': return jsonify({'message': 'Transação não aguarda pagamento'}), 409
+    transaction.status = 'PAID'; db.session.commit()
+    return jsonify({'message': 'Pagamento realizado com sucesso!'})
+
+@app.route('/transaction/<int:transaction_id>/ship', methods=['POST'])
+@token_required
+def ship_transaction(current_user, transaction_id):
+    transaction = Transaction.query.get_or_404(transaction_id)
+    if transaction.seller_id != current_user.id: return jsonify({'message': 'Apenas o vendedor pode enviar'}), 403
+    if transaction.status != 'PAID': return jsonify({'message': 'Esta transação não foi paga'}), 409
+    transaction.status = 'SHIPPED'; db.session.commit()
+    return jsonify({'message': 'Transação marcada como enviada!'})
+
+@app.route('/transaction/<int:transaction_id>/confirm', methods=['POST'])
+@token_required
+def confirm_transaction(current_user, transaction_id):
+    transaction = Transaction.query.get_or_404(transaction_id)
+    if transaction.buyer_id != current_user.id: return jsonify({'message': 'Apenas o comprador pode confirmar'}), 403
+    if transaction.status != 'SHIPPED': return jsonify({'message': 'Esta transação não foi enviada'}), 409
+    transaction.status = 'COMPLETED'; db.session.commit()
+    return jsonify({'message': 'Recebimento confirmado!'})
+
+@app.route('/transaction/<int:transaction_id>/dispute', methods=['POST'])
+@token_required
+def open_dispute(current_user, transaction_id):
+    transaction = Transaction.query.get_or_404(transaction_id)
+    if transaction.buyer_id != current_user.id: return jsonify({'message': 'Apenas o comprador pode abrir disputa'}), 403
+    if transaction.status != 'SHIPPED': return jsonify({'message': 'Disputas só podem ser abertas após o envio'}), 409
+    transaction.status = 'IN_DISPUTE'; db.session.commit()
+    return jsonify({'message': 'Disputa aberta.'})
+
+@app.route('/transaction/<int:transaction_id>/chat', methods=['GET'])
+@token_required
+def get_chat_messages(current_user, transaction_id):
+    transaction = Transaction.query.get_or_404(transaction_id)
+    if transaction.seller_id != current_user.id and transaction.buyer_id != current_user.id: return jsonify({'message': 'Acesso negado'}), 403
+    messages = ChatMessage.query.filter_by(transaction_id=transaction_id).order_by(ChatMessage.timestamp.asc()).all()
+    output = [{'id': msg.id, 'content': msg.content, 'timestamp': msg.timestamp.strftime('%d/%m %H:%M'), 'author_id': msg.author_id, 'author_name': msg.author.name} for msg in messages]
+    return jsonify(output)
+
+@app.route('/events', methods=['POST'])
+@token_required
+def log_event(current_user):
+    data = request.get_json()
+    if not data or not data.get('event_type') or not data.get('value'): return jsonify({'message': 'Dados de evento inválidos'}), 400
+    new_event = BehavioralEvent(event_type=data['event_type'], value=str(data['value']), transaction_id=data.get('transaction_id'), user_id=current_user.id)
+    db.session.add(new_event); db.session.commit()
+    return jsonify({'message': 'Evento registrado'}), 201
+
+@app.route('/transaction/<int:transaction_id>/risk_score', methods=['GET'])
+@token_required
+def get_risk_score(current_user, transaction_id):
+    transaction = Transaction.query.get_or_404(transaction_id)
+    if transaction.seller_id != current_user.id: return jsonify({'message': 'Acesso negado'}), 403
+    user_id_to_check = transaction.buyer_id or current_user.id
+    events = BehavioralEvent.query.filter_by(user_id=user_id_to_check).all()
+    risk_score, reasons = 0, []
+    if transaction.amount > 1000:
+        risk_score += 25
+        reasons.append(f"Valor alto (R$ {transaction.amount:.2f})")
+    if len(events) > 20:
+        risk_score += 15
+        reasons.append("Atividade de usuário excessiva")
+    fast_fill_count = 0
+    for e in events:
+        if e.event_type == 'form_fill_time':
+            try:
+                if float(e.value) < 3.0: fast_fill_count += 1
+            except (ValueError, TypeError): continue
+    if fast_fill_count > 0:
+        risk_score += 30
+        reasons.append(f"Preenchimento de formulário suspeitosamente rápido ({fast_fill_count}x)")
+    failed_payments = [e for e in events if e.event_type == 'payment_failed']
+    if len(failed_payments) > 2:
+        risk_score += (10 * len(failed_payments))
+        reasons.append(f"{len(failed_payments)} tentativas de pagamento falharam")
+    risk_score = min(risk_score, 100)
+    return jsonify({'transaction_id': transaction_id, 'risk_score': risk_score, 'reasons': reasons})
+
+@app.route('/verify-link', methods=['POST'])
+@token_required
+def verify_link_advanced(current_user):
+    data = request.get_json()
+    url_to_check = data.get('url', '').strip()
+    if not url_to_check:
+        return jsonify({'message': 'URL é obrigatória'}), 400
+    if VT_API_KEY.startswith("SUA_CHAVE"):
+        return jsonify({'message': 'Chave da API do VirusTotal não configurada no servidor.'}), 503
+    findings, risk_score_val, warnings = [], 0, []
+    verdict, store_name, product_name, urlscan_url = "Analisando...", None, None, None
+    is_secure = False
+    final_url = url_to_check
+    try:
+        if not final_url.startswith(('http://', 'https://')):
+            final_url = 'http://' + final_url
+        final_url_parsed = urlparse(final_url)
+        if not final_url_parsed.netloc:
+             raise ValueError("Domínio inválido a partir da URL")
+        is_secure = final_url_parsed.scheme == 'https'
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            page = requests.get(final_url, headers=headers, timeout=10, verify=False)
+            soup = BeautifulSoup(page.content, 'html.parser')
+            domain = final_url_parsed.hostname
+            if domain:
+                store_name = '.'.join(domain.split('.')[-2:])
+                findings.append(f"Loja identificada: {store_name}")
+            if soup.find('title') and soup.find('title').string:
+                product_name = soup.find('title').string.strip()
+                findings.append(f"Produto: {product_name}")
+        except Exception as e:
+            findings.append(f"Aviso: Não foi possível extrair informações de e-commerce ({type(e).__name__}).")
+        url_id = hashlib.sha256(final_url.encode()).hexdigest()
+        vt_response = requests.get(f'https://www.virustotal.com/api/v3/urls/{url_id}', headers={'x-apikey': VT_API_KEY.strip()}, timeout=20)
+        if vt_response.status_code == 200:
+            stats = vt_response.json().get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
+            m, s = stats.get('malicious', 0), stats.get('suspicious', 0)
+            risk_score_val += (m * 2) + s
+            findings.append(f"VirusTotal: {m} maliciosos, {s} suspeitos.")
+            if m > 0 or s > 0: warnings.append(f"{m+s} scanners de segurança marcaram este link como perigoso.")
+        else:
+            findings.append("Link desconhecido pelo VirusTotal (cuidado extra com links novos).")
+        if URLSCAN_API_KEY and not URLSCAN_API_KEY.startswith("SUA_CHAVE"):
+            try:
+                scan_response = requests.post('https://urlscan.io/api/v1/scan/', headers={'API-Key': URLSCAN_API_KEY.strip(), 'Content-Type': 'application/json'}, json={"url": final_url, "visibility": "public"}, timeout=20)
+                if scan_response.status_code == 200:
+                    urlscan_url = scan_response.json().get('result')
+                    findings.append("Screenshot da página está sendo gerado.")
+                else:
+                    findings.append(f"URLScan.io: {scan_response.json().get('message', 'Erro ao submeter')}")
+            except Exception:
+                findings.append("URLScan.io: Não foi possível contatar o serviço.")
+        if risk_score_val >= 3: verdict = "Alto Risco"
+        elif "desconhecido" in findings[-1]:
+            risk_score_val += 1
+            verdict = "Cuidado"
+        else: verdict = "Baixo Risco"
+    except Exception as e:
+        print(f"Erro CRÍTICO ao verificar link: {e}")
+        return jsonify({'message': f'Erro inesperado ao analisar a URL: {type(e).__name__}'}), 500
+    return jsonify({"url_checked": final_url, "verdict": verdict, "safety_score": 100 - (risk_score_val * 10), "warnings": warnings, "is_secure_connection": is_secure})
+# --- [FIM] ROTAS DA API ---
+
+# --- EVENTOS DE WEBSOCKET (Seu código original, intacto) ---
+@socketio.on('join_room')
+def handle_join_room(data):
+    room = str(data['transaction_id'])
+    join_room(room)
+    print(f"Cliente (SID: {request.sid}) entrou na sala de chat: {room}")
+@socketio.on('send_message')
+def handle_send_message(data):
+    room = str(data['transaction_id'])
+    content = data['content']
+    author_id = data['author_id']
+    new_message = ChatMessage(content=content, transaction_id=int(room), author_id=author_id)
+    db.session.add(new_message)
+    db.session.commit()
+    author = User.query.get(author_id)
+    message_to_emit = {
+        'id': new_message.id,
+        'content': new_message.content,
+        'timestamp': new_message.timestamp.strftime('%d/%m %H:%M'),
+        'author_id': new_message.author_id,
+        'author_name': author.name if author else 'Desconhecido'
+    }
+    emit('new_message', message_to_emit, to=room)
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f'Cliente (SID: {request.sid}) desconectou')
+
+# --- ROTAS DO PAINEL DE ADMINISTRAÇÃO (Seu código original, 100% intacto) ---
+def check_admin_auth(username, password):
+    return username == 'root' and password == 'root'
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_admin_auth(auth.username, auth.password):
+            return Response('É necessário fazer login para acessar o painel.', 401, {'WWW-Authenticate': 'Basic realm="Login Required"'})
+        return f(*args, **kwargs)
+    return decorated_function
+@app.route('/admin/')
+@admin_required
+def admin_dashboard():
+    return render_template('admin/admin_panel.html', page_type='dashboard', title='Dashboard')
+@app.route('/admin/users')
+@admin_required
+def list_users():
+    users = User.query.order_by(User.id).all()
+    return render_template('admin/admin_panel.html', page_type='user_list', users=users, title='Gerenciar Usuários')
+@app.route('/admin/user/add', methods=['GET', 'POST'])
+@admin_required
+def add_user():
+    if request.method == 'POST':
+        name, email, password = request.form.get('name'), request.form.get('email'), request.form.get('password')
+        if User.query.filter_by(email=email).first(): flash('Este email já está cadastrado.', 'danger')
+        elif not password: flash('A senha é obrigatória para criar um novo usuário.', 'danger')
+        else:
+            hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
+            new_user = User(name=name, email=email, password_hash=hashed_password)
+            db.session.add(new_user); db.session.commit()
+            flash('Usuário criado com sucesso!', 'success')
+            return redirect(url_for('list_users'))
+    return render_template('admin/admin_panel.html', page_type='user_form', form_title='Adicionar Usuário', user=None, title='Adicionar Usuário')
+@app.route('/admin/user/edit/<int:user_id>', methods=['GET', 'POST'])
+@admin_required
+def edit_user(user_id):
+    user = User.query.get_or_404(user_id)
+    if request.method == 'POST':
+        user.name, user.email, password = request.form.get('name'), request.form.get('email'), request.form.get('password')
+        if password: user.password_hash = bcrypt.generate_password_hash(password).decode('utf-8')
+        db.session.commit()
+        flash('Usuário atualizado com sucesso!', 'success')
+        return redirect(url_for('list_users'))
+    return render_template('admin/admin_panel.html', page_type='user_form', form_title='Editar Usuário', user=user, title='Editar Usuário')
+@app.route('/admin/user/delete/<int:user_id>', methods=['POST'])
+@admin_required
+def delete_user(user_id):
+    user = User.query.get_or_404(user_id)
+    db.session.delete(user); db.session.commit()
+    flash('Usuário deletado com sucesso!', 'danger')
+    return redirect(url_for('list_users'))
+@app.route('/admin/transactions')
+@admin_required
+def list_transactions():
+    transactions = Transaction.query.order_by(Transaction.id.desc()).all()
+    return render_template('admin/admin_panel.html', page_type='transaction_list', transactions=transactions, title='Gerenciar Transações')
+@app.route('/admin/transaction/add', methods=['GET', 'POST'])
+@admin_required
+def add_transaction():
+    if request.method == 'POST':
+        new_transaction = Transaction(
+            description=request.form.get('description'),
+            amount=float(request.form.get('amount')),
+            status=request.form.get('status'),
+            seller_id=int(request.form.get('seller_id')),
+            buyer_id=int(request.form.get('buyer_id')) if request.form.get('buyer_id') else None)
+        db.session.add(new_transaction); db.session.commit()
+        flash('Transação criada com sucesso!', 'success')
+        return redirect(url_for('list_transactions'))
+    users, statuses = User.query.all(), ['PENDING', 'AWAITING_PAYMENT', 'PAID', 'SHIPPED', 'COMPLETED', 'IN_DISPUTE', 'REFUNDED']
+    return render_template('admin/admin_panel.html', page_type='transaction_form', form_title='Adicionar Transação', users=users, statuses=statuses, transaction=None, title='Adicionar Transação')
+@app.route('/admin/transaction/edit/<int:transaction_id>', methods=['GET', 'POST'])
+@admin_required
+def edit_transaction(transaction_id):
+    transaction = Transaction.query.get_or_404(transaction_id)
+    if request.method == 'POST':
+        transaction.description, transaction.amount = request.form.get('description'), float(request.form.get('amount'))
+        transaction.status, transaction.seller_id = request.form.get('status'), int(request.form.get('seller_id'))
+        transaction.buyer_id = int(request.form.get('buyer_id')) if request.form.get('buyer_id') else None
+        db.session.commit()
+        flash('Transação atualizada com sucesso!', 'success')
+        return redirect(url_for('list_transactions'))
+    users, statuses = User.query.all(), ['PENDING', 'AWAITING_PAYMENT', 'PAID', 'SHIPPED', 'COMPLETED', 'IN_DISPUTE', 'REFUNDED']
+    return render_template('admin/admin_panel.html', page_type='transaction_form', form_title='Editar Transação', transaction=transaction, users=users, statuses=statuses, title='Editar Transação')
+@app.route('/admin/transaction/delete/<int:transaction_id>', methods=['POST'])
+@admin_required
+def delete_transaction(transaction_id):
+    transaction = Transaction.query.get_or_404(transaction_id)
+    db.session.delete(transaction); db.session.commit()
+    flash('Transação deletada com sucesso!', 'danger')
+    return redirect(url_for('list_transactions'))
+@app.route('/admin/chat')
+@admin_required
+def list_chat_messages():
+    messages = ChatMessage.query.order_by(ChatMessage.timestamp.desc()).all()
+    return render_template('admin/admin_panel.html', page_type='chat_list', messages=messages, title='Gerenciar Chat')
+@app.route('/admin/chat/add', methods=['GET', 'POST'])
+@admin_required
+def add_chat_message():
+    if request.method == 'POST':
+        new_message = ChatMessage(
+            content=request.form.get('content'),
+            transaction_id=int(request.form.get('transaction_id')),
+            author_id=int(request.form.get('author_id')))
+        db.session.add(new_message); db.session.commit()
+        flash('Mensagem criada com sucesso!', 'success')
+        return redirect(url_for('list_chat_messages'))
+    users, transactions = User.query.all(), Transaction.query.all()
+    return render_template('admin/admin_panel.html', page_type='chat_form', form_title='Adicionar Mensagem', users=users, transactions=transactions, message=None, title='Adicionar Mensagem')
+@app.route('/admin/chat/edit/<int:message_id>', methods=['GET', 'POST'])
+@admin_required
+def edit_chat_message(message_id):
+    message = ChatMessage.query.get_or_404(message_id)
+    if request.method == 'POST':
+        message.content, message.transaction_id = request.form.get('content'), int(request.form.get('transaction_id'))
+        message.author_id = int(request.form.get('author_id'))
+        db.session.commit()
+        flash('Mensagem atualizada com sucesso!', 'success')
+        return redirect(url_for('list_chat_messages'))
+    users, transactions = User.query.all(), Transaction.query.all()
+    return render_template('admin/admin_panel.html', page_type='chat_form', form_title='Editar Mensagem', message=message, users=users, transactions=transactions, title='Editar Mensagem')
+@app.route('/admin/chat/delete/<int:message_id>', methods=['POST'])
+@admin_required
+def delete_chat_message(message_id):
+    message = ChatMessage.query.get_or_404(message_id)
+    db.session.delete(message); db.session.commit()
+    flash('Mensagem deletada com sucesso!', 'danger')
+    return redirect(url_for('list_chat_messages'))
+
+# --- FUNÇÃO PARA INICIAR O SERVIDOR ---
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
+
+
