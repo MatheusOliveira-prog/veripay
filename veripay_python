@@ -12,8 +12,8 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 
 # --- [IMPORTANTE] COLOQUE SUAS CHAVES DE API AQUI ---
-VT_API_KEY = "2a002bf45a4c2e70867701051091c42df8b0c9529d3cf6cd9009647a629413ae"
-URLSCAN_API_KEY = "0198f827-d271-716d-993c-409598a5779a"
+VT_API_KEY = "---------"
+URLSCAN_API_KEY = "----------------"
 # ----------------------------------------------------
 requests.packages.urllib3.disable_warnings()
 
