@@ -25,18 +25,31 @@ Armazena de forma persistente todos os dados da aplicação. Projetado para ser 
 3. Documentação do Backend (app.py)
 O backend é construído com o micro-framework Flask, escolhido pela sua simplicidade e flexibilidade.
 Tecnologias Utilizadas:
+
 Flask: Framework web.
+
 Flask-SQLAlchemy: ORM para interação com o banco de dados.
+
 Flask-Bcrypt: Criptografia de senhas.
+
 Flask-SocketIO: Habilita comunicação em tempo real (WebSockets) para o chat.
+
 PyJWT: Geração e validação de JSON Web Tokens para autenticação.
+
 Gunicorn/Eventlet: Servidor WSGI de produção.
+
 Requests & BeautifulSoup4: Para a análise de links externos.
+
 Estrutura do Banco de Dados (Modelos):
+
 User: Armazena dados do usuário. A senha é sempre armazenada como um hash bcrypt.
+
 Transaction: O coração do sistema escrow. Contém descrição, valor, status e as chaves estrangeiras para o vendedor e o comprador.
+
 ChatMessage: Armazena uma única mensagem, ligada a uma transação e a um autor.
+
 BehavioralEvent: Registra eventos de comportamento do usuário (ex: tempo de preenchimento de formulário) para a análise de risco da IA.
+
 Endpoints da API (Rotas RESTful):
 
 POST /auth/register: Cria um novo usuário.
@@ -88,17 +101,28 @@ Socket.IO Client: Para a comunicação em tempo real do chat.
 Coroutines & StateFlow: Para gerenciamento de estado e operações assíncronas.
 
 Estrutura do Projeto:
-data: Contém ApiService (definição das rotas), ApiModels (modelos de dados), TokenManager (gerenciamento do JWT), SocketManager (gerenciamento do WebSocket), e AuthInterceptor (adiciona o token a todas as chamadas).
+
+data: Contém ApiService (definição das rotas), ApiModels (modelos de dados), TokenManager (gerenciamento do JWT), SocketManager (gerenciamento do WebSocket), e AuthInterceptor (adiciona o 
+token a todas as chamadas).
+
 ui: Contém todos os @Composable que formam as telas do aplicativo, separados por funcionalidade (auth, home, detail, chat, etc.).
+
 viewmodel: Contém as classes ViewModel para cada tela, que orquestram a lógica e os dados.
 
 Principais Funcionalidades Implementadas:
 
 Login Persistente: O app verifica a validade de um token JWT salvo. Se for válido, o usuário é direcionado para a tela principal, caso contrário, para a de login.
+
 Tela Principal com Abas: Uma MainScreen organiza o conteúdo em duas abas: "Transações" e "Verificar Links".
+
 Lista de Transações: Exibe as transações em seções ("Ações Pendentes" e "Histórico") e usa ícones para indicar o papel do usuário.
+
 Tela de Detalhes: Mostra todas as informações de uma transação e os botões de ação apropriados para o estado e o usuário atual.
+
 Linha do Tempo e Análise de Risco: Na tela de detalhes, um componente visual mostra o progresso do status da transação. Para o vendedor, um card animado exibe a pontuação de risco da IA.
+
 Fluxo de Criação: Telas dedicadas para a criação de novas transações.
+
 Chat em Tempo Real: Uma tela de chat funcional que se atualiza instantaneamente com novas mensagens via WebSockets.
+
 Verificador de Links: Uma tela dedicada onde o usuário pode colar URLs externas e receber uma análise de segurança completa, alimentada pelo backend.
