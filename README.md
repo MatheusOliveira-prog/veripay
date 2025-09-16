@@ -1,6 +1,7 @@
 1. Introdução ao Projeto
    
 O VeriPay é um aplicativo móvel com um backend robusto, projetado para aumentar a segurança em transações de e-commerce e entre pessoas (P2P). O projeto unifica duas ideias centrais de segurança:
+
 PayGuard: Um sistema de pagamento em custódia (escrow) que protege tanto o comprador quanto o vendedor, garantindo que o pagamento só seja liberado após a confirmação do recebimento e da qualidade do produto.
 
 ShopSafe AI: Uma camada de inteligência artificial que analisa transações e links de e-commerce em tempo real para detectar comportamentos fraudulentos e links maliciosos, fornecendo uma pontuação de risco para o usuário.
